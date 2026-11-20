@@ -107,6 +107,36 @@ Call the main script with the following command:
 ```bash
 python main.py [--conf-path CONFPATH]
 ```
+
+The default mode is the original MERL `direct-act` implementation. Switch representation methods and score normalization without editing the YAML file:
+
+```bash
+python main.py --mode direct-act --feature-exchange on
+python main.py --mode direct-act --feature-exchange off
+python main.py --mode contrastive
+python main.py --mode stat-contrastive
+python main.py --mode contrastive --norm-type none
+python main.py --mode contrastive --norm-type LOF --norm-param 16
+```
+
+## Comparative representation experiments
+
+The default configuration retains MERL's original `direct-act` method. In this upstream implementation, `direct-act` already enables the two-branch Feature Exchange loss. Set `model.feature_exchange_enabled: false` to run a matched ablation with the same branches and the Feature Exchange loss disabled.
+
+Two additional modes use the same MERL reference construction, score normalization, and evaluator:
+
+* `contrastive`: ResNet-18 log-Mel embeddings trained with NT-Xent.
+* `stat-contrastive`: the same encoder trained with contrastive positives defined by k-means clusters of normal-training log-Mel statistics. The scaler and clusters are fitted from the training loader only.
+
+These are paper-inspired implementations, not claims of exact reproduction. In particular, the contrastive paths use MERL's downstream score pipeline instead of the covariance/Mahalanobis scoring used by the DCASE 2023 contrastive report. See `conf.yaml` for the dataset, method, batch size, worker count, and device settings. DCASE 2023 is the initial shared benchmark setting.
+
+### Memory and data handling
+
+Preprocessing writes waveform/embedding partitions to NumPy memory-mapped cache files one sample at a time. Training and prediction read one example at a time from those caches, rather than copying all audio into RAM. The starting configuration uses batch size 8, zero DataLoader workers, and one model run. Increase these values only after a small run shows that memory and storage are sufficient. The caches still require disk space for each processed partition; no dataset is bundled or downloaded automatically.
+
+The default training run skips validation during fitting so development test anomaly labels are not used for checkpoint selection. Final development metrics are computed after training. Keep `model.standardize: false` for the primary non-transductive comparison; enabling it estimates score statistics from test embeddings.
+
+For the planned normalization sweep, reuse each trained checkpoint and run `model.norm_type` as `none`, `ratio`, `difference`, and `LOF`, with a fixed `norm_param` for the methods that require it. Do not compare methods with different source-reference settings.
 The optional argument `--conf-path` specifies the path to the `conf.yaml` file, which contains information about the dataset to be used. This file contains all parameter values for the datasets, models, training, and embeddings that can be modified by the user. In the following, we provide more details for all parameters that are not necessarily self-explanatory:
 
 - `model`: The embedding model being used. Based on the notation used in the paper, the following options are provided:

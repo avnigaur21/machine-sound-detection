@@ -3,7 +3,11 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 from argparse import ArgumentParser, Namespace
+import csv
+from datetime import datetime
+import os
 from pathlib import Path
+import time
 
 import lightning as L
 import numpy as np
@@ -11,7 +15,12 @@ import torch
 import yaml
 
 from dataset import DCASEASDDataModule, find_max_size, prepare_dataset
-from lightning_module import ASDsystem, raw_system, trainedACTsystem
+from lightning_module import (
+    ASDsystem,
+    ContrastiveASDsystem,
+    raw_system,
+    trainedACTsystem,
+)
 from utils import (
     get_ASD_performance_from_scores,
     get_mean_embs,
@@ -26,11 +35,46 @@ if __name__ == "__main__":
         type=Path,
         help="The path to the YAML configuration file (conf.yaml).",
     )
+    parser.add_argument(
+        "--mode",
+        choices=("direct-act", "contrastive", "stat-contrastive", "STFT-raw", "openL3-act", "openL3-raw", "BEATs-act", "BEATs-raw", "EAT-raw"),
+        help="Override model.mode in the YAML configuration.",
+    )
+    parser.add_argument(
+        "--norm-type",
+        choices=("none", "ratio", "difference", "LOF"),
+        help="Override model.norm_type for a scoring-only normalization sweep.",
+    )
+    parser.add_argument(
+        "--norm-param",
+        help="Override model.norm_param (K for k-NN/LOF, or r for GWRP).",
+    )
+    parser.add_argument(
+        "--feature-exchange",
+        choices=("on", "off"),
+        help="Enable/disable the MERL direct-act Feature Exchange loss.",
+    )
+    parser.add_argument("--batch-size", type=int, help="Override training.batch_size.")
+    parser.add_argument("--n-ensemble", type=int, help="Override training.n_ensemble.")
     args = parser.parse_args()
 
     with open(args.conf_path) as file:
         params = yaml.load(file, Loader=yaml.FullLoader)
         hparams = Namespace(**params)
+    if args.mode is not None:
+        hparams.model["mode"] = args.mode
+    if args.norm_type is not None:
+        hparams.model["norm_type"] = args.norm_type
+    if args.norm_param is not None:
+        hparams.model["norm_param"] = args.norm_param
+    if args.feature_exchange is not None:
+        hparams.model["feature_exchange_enabled"] = args.feature_exchange == "on"
+    if args.batch_size is not None:
+        hparams.training["batch_size"] = args.batch_size
+    if args.n_ensemble is not None:
+        hparams.training["n_ensemble"] = args.n_ensemble
+    if hparams.training["batch_size"] < 1 or hparams.training["n_ensemble"] < 1:
+        raise ValueError("batch_size and n_ensemble must both be positive.")
 
     dataset_path = hparams.dataset["path"]
     edition = hparams.dataset["edition"]
@@ -76,13 +120,18 @@ if __name__ == "__main__":
         raise TypeError("LOF requires a value of K to be provided!")
 
     # prepare data
-    if mode == "direct-act":
+    if mode in ("direct-act", "contrastive", "stat-contrastive"):
         target_dir = "./" + edition + "_processed"
         prepare_dataset(
             data_dir=dataset_path, target_dir=target_dir, edition=edition
         )
         input_dim = find_max_size(data_dir=dataset_path)
-        max_epochs = hparams.training["num_epochs_direct-act"]
+        if mode == "direct-act":
+            max_epochs = hparams.training["num_epochs_direct-act"]
+        elif mode == "contrastive":
+            max_epochs = hparams.training["num_epochs_contrastive"]
+        else:
+            max_epochs = hparams.training["num_epochs_stat-contrastive"]
     elif mode == "openL3-act" or mode == "openL3-raw":
         target_dir = "./" + edition + "_openL3_processed"
         prepare_dataset(
@@ -137,6 +186,7 @@ if __name__ == "__main__":
     dcase_asd = DCASEASDDataModule(
         data_dir=target_dir,
         batch_size=hparams.training["batch_size"],
+        num_workers=hparams.training.get("num_workers", 0),
         use_eval_for_train=True,
         use_dev_for_train=True,
         use_dev_for_pred=True,
@@ -156,10 +206,16 @@ if __name__ == "__main__":
     else:
         n_metrics = 9
     all_scores_eval = []
+    runtimes_seconds = []
     performances_eval = np.zeros((n_ensemble, n_metrics))
     all_scores_dev = []
     performances_dev = np.zeros((n_ensemble, n_metrics))
     for k_ensemble in np.arange(n_ensemble):
+        run_started_at = time.perf_counter()
+        L.seed_everything(
+            int(hparams.training.get("seed", 42)) + int(k_ensemble),
+            workers=True,
+        )
         print("Running ensemble iteration #" + str(k_ensemble + 1))
         tb_logger = L.pytorch.loggers.TensorBoardLogger(
             save_dir="logs/",
@@ -175,6 +231,22 @@ if __name__ == "__main__":
                 bias=hparams.model["bias"],
                 affine=hparams.model["affine"],
                 trainable_centers=hparams.model["trainable_centers"],
+                feature_exchange_enabled=hparams.model.get(
+                    "feature_exchange_enabled", True
+                ),
+                source_K=source_K,
+                K=K,
+                r=r,
+                norm_type=norm_type,
+                standardize=standardize,
+                smote=smote,
+                smote_num_neighbors=smote_num_neighbors,
+            )
+        elif mode in ("contrastive", "stat-contrastive"):
+            asd_system = ContrastiveASDsystem(
+                method=mode,
+                n_clusters=hparams.model.get("n_clusters", 8),
+                temperature=hparams.model.get("temperature", 0.05),
                 source_K=source_K,
                 K=K,
                 r=r,
@@ -202,7 +274,7 @@ if __name__ == "__main__":
         elif (
             mode == "openL3-raw"
             or mode == "BEATs-raw"
-            or "EAT-raw"
+            or mode == "EAT-raw"
             or mode == "STFT-raw"
         ):
             asd_system = raw_system(
@@ -214,17 +286,29 @@ if __name__ == "__main__":
                 smote=smote,
                 smote_num_neighbors=smote_num_neighbors,
             )
+        accelerator = hparams.training.get("accelerator", "auto")
         trainer = L.Trainer(
             max_epochs=max_epochs,
             num_sanity_val_steps=0,
             logger=tb_logger,
-            accelerator="gpu",
+            accelerator=accelerator,
             devices=1,
             enable_checkpointing=False,
+            limit_val_batches=(
+                1.0
+                if hparams.training.get("validate_during_training", False)
+                else 0
+            ),
         )  # no sanity checks because means are not yet available
 
         # train model
-        if mode == "direct-act" or mode == "openL3-act" or mode == "BEATs-act":
+        if mode in (
+            "direct-act",
+            "contrastive",
+            "stat-contrastive",
+            "openL3-act",
+            "BEATs-act",
+        ):
             model_name = "#".join(
                 [
                     edition,
@@ -235,13 +319,22 @@ if __name__ == "__main__":
                     str(hparams.model["bias"]),
                     str(hparams.model["affine"]),
                     str(hparams.model["trainable_centers"]),
+                    str(hparams.model.get("feature_exchange_enabled", True)),
+                    str(hparams.model.get("n_clusters", 8)),
+                    str(hparams.model.get("temperature", 0.05)),
                     ".ckpt",
                 ]
             )
-            model_path = Path(hparams.training["model_dir"] + model_name)
+            model_dir = Path(hparams.training["model_dir"])
+            model_dir.mkdir(parents=True, exist_ok=True)
+            model_path = model_dir / model_name
             if model_path.is_file() and hparams.training["use_checkpoints"]:
                 if mode == "direct-act":
                     asd_system = ASDsystem.load_from_checkpoint(
+                        checkpoint_path=model_path
+                    )
+                elif mode in ("contrastive", "stat-contrastive"):
+                    asd_system = ContrastiveASDsystem.load_from_checkpoint(
                         checkpoint_path=model_path
                     )
                 elif mode == "openL3-act" or mode == "BEATs-act":
@@ -251,7 +344,7 @@ if __name__ == "__main__":
                 asd_system.source_K = source_K
                 asd_system.K = K
                 asd_system.r = r
-                asd_system.norm_type = norm_type = norm_type
+                asd_system.norm_type = norm_type
                 asd_system.standardize = standardize
                 asd_system.smote = smote
                 asd_system.smote_num_neighbors = smote_num_neighbors
@@ -263,9 +356,10 @@ if __name__ == "__main__":
 
         # reload all data
         asd_system.eval()  # disables randomness
+        asd_system.to(trainer.strategy.root_device)
         # re-calculate means
         for batch_idx, batch in enumerate(dcase_asd.train_dataloader()):
-            asd_system.to("cuda").reload_training_embs(batch, batch_idx)
+            asd_system.reload_training_embs(batch, batch_idx)
         (
             asd_system.means,
             asd_system.mean_machine_ids,
@@ -284,6 +378,7 @@ if __name__ == "__main__":
         dcase_asd_test = DCASEASDDataModule(
             data_dir=target_dir,
             batch_size=hparams.training["batch_size"],
+            num_workers=hparams.training.get("num_workers", 0),
             use_eval_for_train=False,
             use_eval_for_pred=False,
             use_dev_for_train=True,
@@ -319,6 +414,7 @@ if __name__ == "__main__":
         dcase_asd_test = DCASEASDDataModule(
             data_dir=target_dir,
             batch_size=hparams.training["batch_size"],
+            num_workers=hparams.training.get("num_workers", 0),
             use_eval_for_train=True,
             use_eval_for_pred=True,
             use_dev_for_train=False,
@@ -353,6 +449,7 @@ if __name__ == "__main__":
             )
         )
         asd_system.on_train_epoch_end()  # delete stored training embeddings
+        runtimes_seconds.append(time.perf_counter() - run_started_at)
 
     # output performance
     print(
@@ -381,6 +478,52 @@ if __name__ == "__main__":
         return_domain_specific=edition != "DCASE2020",
         eval_metrics=hparams.dataset["eval_metrics"],
     )
+
+    metric_names = (
+        [
+            "mean_auc",
+            "mean_pauc",
+            "mean_hmean_auc_pauc",
+            "hmean_auc",
+            "hmean_pauc",
+            "hmean_all",
+        ]
+        if edition == "DCASE2020"
+        else [
+            f"{domain}_{metric}"
+            for domain in ("source", "target", "mixed")
+            for metric in ("hmean_auc", "hmean_pauc", "hmean_all")
+        ]
+    )
+    norm_label = norm_type or "none"
+    result_dir = Path(hparams.training.get("results_dir", "results"))
+    result_dir.mkdir(parents=True, exist_ok=True)
+    result_path = result_dir / (
+        f"{edition}_{mode}_{norm_label}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.csv"
+    )
+    with result_path.open("w", newline="", encoding="utf-8") as result_file:
+        writer = csv.DictWriter(
+            result_file,
+            fieldnames=("edition", "method", "norm_type", "seed", "split", "runtime_seconds")
+            + tuple(metric_names),
+        )
+        writer.writeheader()
+        for split_name, performances in (
+            ("development", performances_dev),
+            ("evaluation", performances_eval),
+        ):
+            for run_index, values in enumerate(performances):
+                row = {
+                    "edition": edition,
+                    "method": mode,
+                    "norm_type": norm_label,
+                    "seed": int(hparams.training.get("seed", 42)) + run_index,
+                    "split": split_name,
+                    "runtime_seconds": runtimes_seconds[run_index],
+                }
+                row.update(dict(zip(metric_names, values.tolist())))
+                writer.writerow(row)
+    print(f"Per-run metrics written to {result_path}")
     print(
         "################################################################################"
     )

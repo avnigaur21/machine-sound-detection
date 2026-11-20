@@ -4,6 +4,7 @@
 
 import csv
 import os
+import shutil
 
 import librosa
 import lightning as L
@@ -14,10 +15,9 @@ import soundfile as sf
 import torch
 import torch.nn.functional as F
 import torchaudio
-import torchopenl3
 from einops import rearrange
 from sklearn.preprocessing import LabelEncoder
-from torch.utils.data import DataLoader
+from torch.utils.data import ConcatDataset, DataLoader, Dataset
 from tqdm import tqdm
 from transformers import AutoModel
 
@@ -204,8 +204,14 @@ def get_data_from_dir(
     edition: str = "DCASE2024",
     new_sr: int = None,
     pre_model: str = None,
+    wav_cache_path: str = None,
 ):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
     collected_wav = []
     collected_anomaly_label = []
     collected_machine_id_label = []
@@ -213,6 +219,8 @@ def get_data_from_dir(
     collected_attribute_label = []
     collected_file_names = []
     if pre_model == "openL3":
+        import torchopenl3
+
         openL3_model = torchopenl3.models.load_audio_embedding_model(
             input_repr="mel128", embedding_size=512, content_type="env"
         )
@@ -221,13 +229,13 @@ def get_data_from_dir(
         cfg = BEATsConfig(checkpoint["cfg"])
         BEATs_model = BEATs(cfg)
         BEATs_model.load_state_dict(checkpoint["model"])
-        BEATs_model.eval().cuda()
+        BEATs_model.eval().to(device)
     elif pre_model == "EAT":
         model_id = "worstchan/EAT-large_epoch20_pretrain"
         EAT_model = (
             AutoModel.from_pretrained(model_id, trust_remote_code=True)
             .eval()
-            .cuda()
+            .to(device)
         )
         new_size = None
     elif pre_model == "STFT":
@@ -236,14 +244,41 @@ def get_data_from_dir(
             nfft=1024,
             temporal_normalization=False,
         ).to(device)
+    audio_files = []
     for category in os.listdir(os.path.join(data_dir, dataset)):
-        for file_name in tqdm(
-            os.listdir(os.path.join(data_dir, dataset, category, data_split))
-        ):
+        for file_name in os.listdir(os.path.join(data_dir, dataset, category, data_split)):
             if file_name.endswith(".wav"):
-                file_path = os.path.join(
-                    data_dir, dataset, category, data_split, file_name
-                )
+                audio_files.append((category, file_name))
+    wav_cache = None
+    if wav_cache_path is not None:
+        if pre_model == "openL3":
+            feature_shape = (len(audio_files), 512)
+        elif pre_model == "BEATs":
+            feature_shape = (len(audio_files), 6144)
+        elif pre_model == "EAT":
+            feature_shape = (len(audio_files), 6912)
+        elif pre_model == "STFT":
+            feature_shape = (len(audio_files), 513)
+        else:
+            feature_shape = (len(audio_files), int(new_size))
+        partial_path = wav_cache_path + ".partial.npy"
+        if os.path.exists(partial_path):
+            os.remove(partial_path)
+        required_bytes = int(np.prod(feature_shape) * np.dtype(np.float32).itemsize)
+        available_bytes = shutil.disk_usage(os.path.dirname(wav_cache_path)).free
+        reserve_bytes = max(256 * 1024 * 1024, int(required_bytes * 0.05))
+        if available_bytes < required_bytes + reserve_bytes:
+            raise RuntimeError(
+                "Not enough free disk space for the next processed partition: "
+                f"need about {required_bytes / (1024**3):.2f} GiB plus reserve, "
+                f"have {available_bytes / (1024**3):.2f} GiB."
+            )
+        wav_cache = np.lib.format.open_memmap(
+            partial_path, mode="w+", dtype=np.float32, shape=feature_shape
+        )
+    for item_index, (category, file_name) in enumerate(tqdm(audio_files)):
+        if file_name.endswith(".wav"):
+                file_path = os.path.join(data_dir, dataset, category, data_split, file_name)
                 (
                     wav,
                     anomaly_label,
@@ -252,6 +287,8 @@ def get_data_from_dir(
                     attribute_label,
                 ) = get_data_for_audio(file_path, new_size, edition, new_sr)
                 if pre_model == "openL3":
+                    import torchopenl3
+
                     with torch.no_grad():
                         wav, _ = torchopenl3.get_audio_embedding(
                             np.expand_dims(wav, axis=0),
@@ -349,7 +386,10 @@ def get_data_from_dir(
                     wav = (
                         torch.mean(wav, dim=1).cpu().numpy()[0, :]
                     )  # mean pooling over temporal dimension
-                collected_wav.append(wav)
+                if wav_cache is None:
+                    collected_wav.append(wav)
+                else:
+                    wav_cache[item_index] = np.asarray(wav, dtype=np.float32).reshape(-1)
                 collected_anomaly_label.append(anomaly_label)
                 collected_machine_id_label.append(machine_id_label)
                 collected_source_label.append(source_label)
@@ -361,7 +401,13 @@ def get_data_from_dir(
                     + "___"
                     + file_name.split(".wav")[0]
                 )
-    collected_wav = np.array(collected_wav)
+    if wav_cache is not None:
+        wav_cache.flush()
+        del wav_cache
+        os.replace(partial_path, wav_cache_path)
+        collected_wav = np.load(wav_cache_path, mmap_mode="r")
+    else:
+        collected_wav = np.array(collected_wav)
     collected_anomaly_label = np.array(collected_anomaly_label)
     collected_machine_id_label = np.array(collected_machine_id_label)
     collected_source_label = np.array(collected_source_label)
@@ -442,7 +488,8 @@ def prepare_dataset(
             eval_test_attribute_label,
             eval_test_file_names,
         ) = get_data_from_dir(
-            data_dir, "eval_data", "test", pad_size, edition, new_sr, pre_model
+            data_dir, "eval_data", "test", pad_size, edition, new_sr, pre_model,
+            os.path.join(target_dir, "eval_test_wav.npy"),
         )
         # store data
         np.save(
@@ -465,7 +512,6 @@ def prepare_dataset(
             os.path.join(target_dir, "eval_test_file_names.npy"),
             eval_test_file_names,
         )
-        np.save(os.path.join(target_dir, "eval_test_wav.npy"), eval_test_wav)
 
     if not os.path.isfile(os.path.join(target_dir, "dev_train_wav.npy")):
         # collect data
@@ -477,7 +523,8 @@ def prepare_dataset(
             dev_train_attribute_label,
             dev_train_file_names,
         ) = get_data_from_dir(
-            data_dir, "dev_data", "train", pad_size, edition, new_sr, pre_model
+            data_dir, "dev_data", "train", pad_size, edition, new_sr, pre_model,
+            os.path.join(target_dir, "dev_train_wav.npy"),
         )
         # store data
         np.save(
@@ -500,7 +547,6 @@ def prepare_dataset(
             os.path.join(target_dir, "dev_train_file_names.npy"),
             dev_train_file_names,
         )
-        np.save(os.path.join(target_dir, "dev_train_wav.npy"), dev_train_wav)
 
     if not os.path.isfile(os.path.join(target_dir, "eval_train_wav.npy")):
         # collect data
@@ -519,6 +565,7 @@ def prepare_dataset(
             edition,
             new_sr,
             pre_model,
+            os.path.join(target_dir, "eval_train_wav.npy"),
         )
         np.save(
             os.path.join(target_dir, "eval_train_anomaly_label.npy"),
@@ -540,7 +587,6 @@ def prepare_dataset(
             os.path.join(target_dir, "eval_train_file_names.npy"),
             eval_train_file_names,
         )
-        np.save(os.path.join(target_dir, "eval_train_wav.npy"), eval_train_wav)
 
     if not os.path.isfile(os.path.join(target_dir, "dev_test_wav.npy")):
         # collect data
@@ -552,7 +598,8 @@ def prepare_dataset(
             dev_test_attribute_label,
             dev_test_file_names,
         ) = get_data_from_dir(
-            data_dir, "dev_data", "test", pad_size, edition, new_sr, pre_model
+            data_dir, "dev_data", "test", pad_size, edition, new_sr, pre_model,
+            os.path.join(target_dir, "dev_test_wav.npy"),
         )
         np.save(
             os.path.join(target_dir, "dev_test_anomaly_label.npy"),
@@ -574,7 +621,6 @@ def prepare_dataset(
             os.path.join(target_dir, "dev_test_file_names.npy"),
             dev_test_file_names,
         )
-        np.save(os.path.join(target_dir, "dev_test_wav.npy"), dev_test_wav)
 
         # re-collect labels (inside the last if-clause to only do this once!)
         dev_train_machine_id_label = np.load(
@@ -687,6 +733,31 @@ def fix_filenames(data_dir: str):
             os.rename(file_path, new_file_path)
 
 
+class CachedNpyDataset(Dataset):
+    """Lazy view over a cached DCASE partition; waveform arrays stay memory-mapped."""
+
+    def __init__(self, data_dir, partition, labels, machine_ids, sources):
+        self.wav_path = os.path.join(data_dir, partition + "_wav.npy")
+        self.labels = torch.as_tensor(labels, dtype=torch.float32)
+        self.machine_ids = torch.as_tensor(machine_ids, dtype=torch.float32)
+        self.sources = torch.as_tensor(sources, dtype=torch.float32)
+        self._wav = None
+        if not (
+            len(self.labels) == len(self.machine_ids) == len(self.sources)
+        ):
+            raise ValueError("Cached data and metadata lengths do not match.")
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, index):
+        if self._wav is None:
+            self._wav = np.load(self.wav_path, mmap_mode="r")
+        # Copy one example only, avoiding a full-array RAM copy and read-only tensors.
+        wav = torch.from_numpy(np.array(self._wav[index], dtype=np.float32, copy=True))
+        return wav, self.labels[index], self.machine_ids[index], self.sources[index]
+
+
 class DCASEASDDataModule(L.LightningDataModule):
     def __init__(
         self,
@@ -722,281 +793,45 @@ class DCASEASDDataModule(L.LightningDataModule):
         return num_classes
 
     def setup(self, stage: str):
-        if stage == "fit":
-            dev_train_attribute_label = np.load(
-                os.path.join(self.data_dir, "dev_train_attribute_label.npy")
-            )
-            dev_train_machine_id_label = torch.tensor(
-                np.load(
-                    os.path.join(
-                        self.data_dir, "dev_train_machine_id_label.npy"
-                    )
-                ),
-                dtype=torch.float32,
-            )
-            dev_train_source_label = torch.tensor(
-                np.load(
-                    os.path.join(self.data_dir, "dev_train_source_label.npy")
-                ),
-                dtype=torch.float32,
-            )
-            eval_train_attribute_label = np.load(
-                os.path.join(self.data_dir, "eval_train_attribute_label.npy")
-            )
-            eval_train_machine_id_label = torch.tensor(
-                np.load(
-                    os.path.join(
-                        self.data_dir, "eval_train_machine_id_label.npy"
-                    )
-                ),
-                dtype=torch.float32,
-            )
-            eval_train_source_label = torch.tensor(
-                np.load(
-                    os.path.join(self.data_dir, "eval_train_source_label.npy")
-                ),
-                dtype=torch.float32,
-            )
-
-            train_labels = np.concatenate(
-                [dev_train_attribute_label, eval_train_attribute_label], axis=0
-            )
-            le = LabelEncoder().fit(train_labels)
-            dev_train_attribute_label = F.one_hot(
-                torch.tensor(le.transform(dev_train_attribute_label)),
-                num_classes=self.num_classes,
-            ).float()
-            eval_train_attribute_label = F.one_hot(
-                torch.tensor(le.transform(eval_train_attribute_label)),
-                num_classes=self.num_classes,
-            ).float()
-            self.train = []
-            if self.use_dev_for_train:
-                dev_train_wav = torch.tensor(
-                    np.load(os.path.join(self.data_dir, "dev_train_wav.npy")),
-                    dtype=torch.float32,
-                )
-                for i in range(len(dev_train_wav)):
-                    if (
-                        dev_train_source_label[i] == 0
-                    ):  # exclude target domain when training by setting all labels to zero
-                        attribute_label = torch.zeros_like(
-                            dev_train_attribute_label[i]
-                        )
-                    else:
-                        attribute_label = dev_train_attribute_label[i]
-                    self.train.append(
-                        [
-                            dev_train_wav[i],
-                            attribute_label,
-                            dev_train_machine_id_label[i],
-                            dev_train_source_label[i],
-                        ]
-                    )
-            if self.use_eval_for_train:
-                eval_train_wav = torch.tensor(
-                    np.load(os.path.join(self.data_dir, "eval_train_wav.npy")),
-                    dtype=torch.float32,
-                )
-                for i in range(len(eval_train_wav)):
-                    if (
-                        eval_train_source_label[i] == 0
-                    ):  # exclude target domain when training by setting all labels to zero
-                        attribute_label = torch.zeros_like(
-                            eval_train_attribute_label[i]
-                        )
-                    else:
-                        attribute_label = eval_train_attribute_label[i]
-                    self.train.append(
-                        [
-                            eval_train_wav[i],
-                            attribute_label,
-                            eval_train_machine_id_label[i],
-                            eval_train_source_label[i],
-                        ]
-                    )
-            dev_test_wav = torch.tensor(
-                np.load(os.path.join(self.data_dir, "dev_test_wav.npy")),
-                dtype=torch.float32,
-            )
-            dev_test_anomaly_label = torch.tensor(
-                np.load(
-                    os.path.join(self.data_dir, "dev_test_anomaly_label.npy")
-                ),
-                dtype=torch.float32,
-            )
-            dev_test_machine_id_label = torch.tensor(
-                np.load(
-                    os.path.join(
-                        self.data_dir, "dev_test_machine_id_label.npy"
-                    )
-                ),
-                dtype=torch.float32,
-            )
-            dev_test_source_label = torch.tensor(
-                np.load(
-                    os.path.join(self.data_dir, "dev_test_source_label.npy")
-                ),
-                dtype=torch.float32,
-            )
-            self.val = []
-            for i in range(len(dev_test_wav)):
-                self.val.append(
-                    [
-                        dev_test_wav[i],
-                        dev_test_anomaly_label[i],
-                        dev_test_machine_id_label[i],
-                        dev_test_source_label[i],
-                    ]
-                )
-        if stage == "validate":
-            dev_test_wav = torch.tensor(
-                np.load(os.path.join(self.data_dir, "dev_test_wav.npy")),
-                dtype=torch.float32,
-            )
-            dev_test_anomaly_label = torch.tensor(
-                np.load(
-                    os.path.join(self.data_dir, "dev_test_anomaly_label.npy")
-                ),
-                dtype=torch.float32,
-            )
-            dev_test_machine_id_label = torch.tensor(
-                np.load(
-                    os.path.join(
-                        self.data_dir, "dev_test_machine_id_label.npy"
-                    )
-                ),
-                dtype=torch.float32,
-            )
-            dev_test_source_label = torch.tensor(
-                np.load(
-                    os.path.join(self.data_dir, "dev_test_source_label.npy")
-                ),
-                dtype=torch.float32,
-            )
-            self.val = []
-            for i in range(len(dev_test_wav)):
-                self.val.append(
-                    [
-                        dev_test_wav[i],
-                        dev_test_anomaly_label[i],
-                        dev_test_machine_id_label[i],
-                        dev_test_source_label[i],
-                    ]
-                )
+        if stage in ("fit", "validate"):
+            train_attribute_arrays = [
+                np.load(os.path.join(self.data_dir, name + "_train_attribute_label.npy"))
+                for name in ("dev", "eval")
+            ]
+            encoder = LabelEncoder().fit(np.concatenate(train_attribute_arrays))
+            train_sets = []
+            for index, partition in enumerate(("dev", "eval")):
+                if (partition == "dev" and not self.use_dev_for_train) or (
+                    partition == "eval" and not self.use_eval_for_train
+                ):
+                    continue
+                source = np.load(os.path.join(self.data_dir, partition + "_train_source_label.npy"))
+                machine = np.load(os.path.join(self.data_dir, partition + "_train_machine_id_label.npy"))
+                encoded = encoder.transform(train_attribute_arrays[index])
+                labels = F.one_hot(torch.as_tensor(encoded), num_classes=self.num_classes).float()
+                source_tensor = torch.as_tensor(source, dtype=torch.float32)
+                labels[source_tensor == 0] = 0
+                train_sets.append(CachedNpyDataset(self.data_dir, partition + "_train", labels, machine, source))
+            self.train = ConcatDataset(train_sets) if len(train_sets) > 1 else train_sets[0]
+            self.val = self._make_test_dataset("dev_test")
         if stage == "test":
-            eval_test_wav = torch.tensor(
-                np.load(os.path.join(self.data_dir, "eval_test_wav.npy")),
-                dtype=torch.float32,
-            )
-            eval_test_anomaly_label = torch.tensor(
-                np.load(
-                    os.path.join(self.data_dir, "eval_test_anomaly_label.npy")
-                ),
-                dtype=torch.float32,
-            )
-            eval_test_machine_id_label = torch.tensor(
-                np.load(
-                    os.path.join(
-                        self.data_dir, "eval_test_machine_id_label.npy"
-                    )
-                ),
-                dtype=torch.float32,
-            )
-            eval_test_source_label = torch.tensor(
-                np.load(
-                    os.path.join(self.data_dir, "eval_test_source_label.npy")
-                ),
-                dtype=torch.float32,
-            )
-            self.test = []
-            for i in range(len(eval_test_wav)):
-                self.test.append(
-                    [
-                        eval_test_wav[i],
-                        eval_test_anomaly_label[i],
-                        eval_test_machine_id_label[i],
-                        eval_test_source_label[i],
-                    ]
-                )
+            self.test = self._make_test_dataset("eval_test")
         if stage == "predict":
-            self.predict = []
+            partitions = []
             if self.use_dev_for_pred:
-                dev_test_wav = torch.tensor(
-                    np.load(os.path.join(self.data_dir, "dev_test_wav.npy")),
-                    dtype=torch.float32,
-                )
-                dev_test_anomaly_label = torch.tensor(
-                    np.load(
-                        os.path.join(
-                            self.data_dir, "dev_test_anomaly_label.npy"
-                        )
-                    ),
-                    dtype=torch.float32,
-                )
-                dev_test_machine_id_label = torch.tensor(
-                    np.load(
-                        os.path.join(
-                            self.data_dir, "dev_test_machine_id_label.npy"
-                        )
-                    ),
-                    dtype=torch.float32,
-                )
-                dev_test_source_label = torch.tensor(
-                    np.load(
-                        os.path.join(
-                            self.data_dir, "dev_test_source_label.npy"
-                        )
-                    ),
-                    dtype=torch.float32,
-                )
-                for i in range(len(dev_test_wav)):
-                    self.predict.append(
-                        [
-                            dev_test_wav[i],
-                            dev_test_anomaly_label[i],
-                            dev_test_machine_id_label[i],
-                            dev_test_source_label[i],
-                        ]
-                    )
+                partitions.append(self._make_test_dataset("dev_test"))
             if self.use_eval_for_pred:
-                eval_test_wav = torch.tensor(
-                    np.load(os.path.join(self.data_dir, "eval_test_wav.npy")),
-                    dtype=torch.float32,
-                )
-                eval_test_anomaly_label = torch.tensor(
-                    np.load(
-                        os.path.join(
-                            self.data_dir, "eval_test_anomaly_label.npy"
-                        )
-                    ),
-                    dtype=torch.float32,
-                )
-                eval_test_machine_id_label = torch.tensor(
-                    np.load(
-                        os.path.join(
-                            self.data_dir, "eval_test_machine_id_label.npy"
-                        )
-                    ),
-                    dtype=torch.float32,
-                )
-                eval_test_source_label = torch.tensor(
-                    np.load(
-                        os.path.join(
-                            self.data_dir, "eval_test_source_label.npy"
-                        )
-                    ),
-                    dtype=torch.float32,
-                )
-                for i in range(len(eval_test_wav)):
-                    self.predict.append(
-                        [
-                            eval_test_wav[i],
-                            eval_test_anomaly_label[i],
-                            eval_test_machine_id_label[i],
-                            eval_test_source_label[i],
-                        ]
-                    )
+                partitions.append(self._make_test_dataset("eval_test"))
+            self.predict = ConcatDataset(partitions) if len(partitions) > 1 else partitions[0]
+
+    def _make_test_dataset(self, partition):
+        return CachedNpyDataset(
+            self.data_dir,
+            partition,
+            np.load(os.path.join(self.data_dir, partition + "_anomaly_label.npy")),
+            np.load(os.path.join(self.data_dir, partition + "_machine_id_label.npy")),
+            np.load(os.path.join(self.data_dir, partition + "_source_label.npy")),
+        )
 
     def train_dataloader(self):
         return DataLoader(
@@ -1004,16 +839,19 @@ class DCASEASDDataModule(L.LightningDataModule):
             batch_size=self.batch_size,
             shuffle=True,
             num_workers=self.num_workers,
+            pin_memory=torch.cuda.is_available(),
         )
 
     def val_dataloader(self):
         return DataLoader(
-            self.val, batch_size=self.batch_size, num_workers=self.num_workers
+            self.val, batch_size=self.batch_size, num_workers=self.num_workers,
+            pin_memory=torch.cuda.is_available(),
         )
 
     def test_dataloader(self):
         return DataLoader(
-            self.test, batch_size=self.batch_size, num_workers=self.num_workers
+            self.test, batch_size=self.batch_size, num_workers=self.num_workers,
+            pin_memory=torch.cuda.is_available(),
         )
 
     def predict_dataloader(self):
@@ -1021,4 +859,5 @@ class DCASEASDDataModule(L.LightningDataModule):
             self.predict,
             batch_size=self.batch_size,
             num_workers=self.num_workers,
+            pin_memory=torch.cuda.is_available(),
         )

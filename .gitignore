@@ -126,6 +126,7 @@ celerybeat.pid
 # Environments
 .env
 .venv
+.venv*/
 env/
 venv/
 ENV/
@@ -175,3 +176,11 @@ evaluation/
 *.png
 *.wav
 *.pdf
+
+# DCASE data and generated training artifacts
+DCASE*_dataset/
+DCASE*_processed/
+dcase2023_task2_evaluator/
+models/
+results/
+logs/

@@ -4,10 +4,13 @@
 
 from abc import abstractmethod
 
+import numpy as np
 import lightning as L
 import torch
 import torch.nn.functional as F
 import torchmetrics
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
 
 from network import (
     AdaProj,
@@ -24,6 +27,13 @@ from utils import (
     get_mean_embs,
     get_scores,
     get_standardization_stats,
+)
+from representation_methods import (
+    ContrastiveAudioEncoder,
+    apply_mel_time_mask,
+    augment_waveforms,
+    nt_xent_loss,
+    statistical_features,
 )
 
 
@@ -77,9 +87,9 @@ class base_emb_model(L.LightningModule):
 
     def reload_training_embs(self, batch, batch_nb):
         x, y, machine_id, source = batch
-        x = x.to("cuda")
-        machine_id = machine_id.to("cuda")
-        source = source.to("cuda")
+        x = x.to(self.device)
+        machine_id = machine_id.to(self.device)
+        source = source.to(self.device)
         embs_orig = self.get_normalized_embs_(x)
         self.train_machine_ids.append(machine_id.detach())
         self.train_embs.append(embs_orig.detach())
@@ -147,23 +157,23 @@ class base_emb_model(L.LightningModule):
             )
         )
 
-        # get standardization statistics
-        (
-            self.dists_source_mean,
-            self.dists_source_std,
-            self.dists_target_mean,
-            self.dists_target_std,
-        ) = get_standardization_stats(
-            self.means,
-            self.mean_machine_ids,
-            self.mean_source_labels,
-            self.val_embs,
-            self.val_machine_ids,
-            use_mse=self.use_mse,
-            K=self.K,
-            r=self.r,
-            norm_type=self.norm_type,
-        )
+        if self.standardize:
+            (
+                self.dists_source_mean,
+                self.dists_source_std,
+                self.dists_target_mean,
+                self.dists_target_std,
+            ) = get_standardization_stats(
+                self.means,
+                self.mean_machine_ids,
+                self.mean_source_labels,
+                self.val_embs,
+                self.val_machine_ids,
+                use_mse=self.use_mse,
+                K=self.K,
+                r=self.r,
+                norm_type=self.norm_type,
+            )
 
         # compute performance
         aauc, apauc, amauc, hauc, hpauc, hmauc = get_ASD_performance(
@@ -203,23 +213,23 @@ class base_emb_model(L.LightningModule):
         return
 
     def on_test_epoch_end(self):
-        # get standardization statistics
-        (
-            self.dists_source_mean,
-            self.dists_source_std,
-            self.dists_target_mean,
-            self.dists_target_std,
-        ) = get_standardization_stats(
-            self.means,
-            self.mean_machine_ids,
-            self.mean_source_labels,
-            self.test_embs,
-            self.test_machine_ids,
-            use_mse=self.use_mse,
-            K=self.K,
-            r=self.r,
-            norm_type=self.norm_type,
-        )
+        if self.standardize:
+            (
+                self.dists_source_mean,
+                self.dists_source_std,
+                self.dists_target_mean,
+                self.dists_target_std,
+            ) = get_standardization_stats(
+                self.means,
+                self.mean_machine_ids,
+                self.mean_source_labels,
+                self.test_embs,
+                self.test_machine_ids,
+                use_mse=self.use_mse,
+                K=self.K,
+                r=self.r,
+                norm_type=self.norm_type,
+            )
 
         # compute performance
         aauc, apauc, amauc, hauc, hpauc, hmauc = get_ASD_performance(
@@ -297,6 +307,95 @@ class raw_system(base_emb_model):
     def get_normalized_embs_(self, x):
         embs = self(x)  # no normalization for raw embeddings
         return embs
+
+
+class ContrastiveASDsystem(base_emb_model):
+    """Shared MERL scoring with NT-Xent or statistical-cluster supervision."""
+
+    def __init__(
+        self,
+        method: str = "contrastive",
+        n_clusters: int = 8,
+        temperature: float = 0.05,
+        source_K: int = None,
+        K: int = None,
+        r: float = None,
+        norm_type: str = "ratio",
+        standardize: bool = False,
+        smote: bool = False,
+        smote_num_neighbors: int = 2,
+    ):
+        super().__init__(
+            source_K=source_K,
+            K=K,
+            r=r,
+            norm_type=norm_type,
+            standardize=standardize,
+            smote=smote,
+            smote_num_neighbors=smote_num_neighbors,
+        )
+        if method not in ("contrastive", "stat-contrastive"):
+            raise ValueError(f"Unknown representation method: {method}")
+        self.method = method
+        self.n_clusters = n_clusters
+        self.temperature = temperature
+        self.encoder = ContrastiveAudioEncoder()
+        self.cluster_scaler = None
+        self.cluster_model = None
+
+    def forward(self, waveforms):
+        return self.encoder(waveforms)[0]
+
+    def get_normalized_embs_(self, waveforms):
+        return F.normalize(self(waveforms), p=2.0, dim=1)
+
+    def on_fit_start(self):
+        if self.method != "stat-contrastive":
+            return
+        # Fit the pseudo-label model from normal training audio only.
+        feature_batches = []
+        for batch in self.trainer.datamodule.train_dataloader():
+            features = statistical_features(self.encoder, batch[0].to(self.device))
+            feature_batches.append(features.detach().cpu().numpy())
+        if not feature_batches:
+            raise RuntimeError("No normal training audio available for clustering.")
+        features = np.concatenate(feature_batches, axis=0)
+        self.cluster_scaler = StandardScaler().fit(features)
+        scaled = self.cluster_scaler.transform(features)
+        cluster_count = min(self.n_clusters, len(scaled))
+        if cluster_count < 2:
+            raise RuntimeError("Statistical clustering requires at least two training recordings.")
+        self.cluster_model = KMeans(
+            n_clusters=cluster_count, random_state=0, n_init=10
+        ).fit(scaled)
+
+    def training_step(self, batch, batch_nb):
+        waveforms = batch[0]
+        view_a = augment_waveforms(waveforms)
+        view_b = augment_waveforms(waveforms)
+        mel_a = apply_mel_time_mask(self.encoder.log_mel(view_a))
+        mel_b = apply_mel_time_mask(self.encoder.log_mel(view_b))
+        emb_a = self.encoder.backbone(mel_a.unsqueeze(1))
+        emb_b = self.encoder.backbone(mel_b.unsqueeze(1))
+        z_a = F.normalize(self.encoder.projector(emb_a), dim=1)
+        z_b = F.normalize(self.encoder.projector(emb_b), dim=1)
+
+        cluster_labels = None
+        if self.method == "stat-contrastive":
+            features = statistical_features(self.encoder, waveforms)
+            labels = self.cluster_model.predict(
+                self.cluster_scaler.transform(features.detach().cpu().numpy())
+            )
+            cluster_labels = torch.as_tensor(labels, device=self.device)
+        loss = nt_xent_loss(
+            z_a, z_b, temperature=self.temperature, labels=cluster_labels
+        )
+        embs = self.get_normalized_embs_(waveforms)
+        self.train_machine_ids.append(batch[2].detach())
+        self.train_embs.append(embs.detach())
+        self.train_source_labels.append(batch[3].detach())
+        self.log("train_contrastive_loss", loss, on_epoch=True, prog_bar=True)
+        return loss
 
 
 class trainedACTsystem(base_emb_model):
@@ -381,6 +480,7 @@ class ASDsystem(base_emb_model):
         trainable_centers: bool = False,
         nfft: int = 1024,
         use_fft: bool = True,
+        feature_exchange_enabled: bool = True,
         temporal_normalization: bool = True,
         source_K: int = None,
         K: int = None,
@@ -407,6 +507,7 @@ class ASDsystem(base_emb_model):
         self.trainable_centers = trainable_centers
         self.nfft = nfft
         self.use_fft = use_fft
+        self.feature_exchange_enabled = feature_exchange_enabled
         self.temporal_normalization = temporal_normalization
         self.stft = STFT_extractor(
             affine=self.affine,
@@ -464,14 +565,14 @@ class ASDsystem(base_emb_model):
             embs_orig = torch.cat((embs_fft, embs_stft), dim=1)
             embs_fft_mix, embs_stft_mix = self(x_mix)
             embs_mix = torch.cat((embs_fft_mix, embs_stft_mix), dim=1)
-            embs_featex, y_featex = feature_exchange(
-                embs_fft_mix, embs_stft_mix, y_mix, p=0.5
-            )
-            logits_featex = self.adaproj_featex(embs_featex, y_featex)
             logits = self.adaproj(embs_mix, y_mix)
-            loss = categorical_cross_entropy(
-                logits, y_mix
-            ) + categorical_cross_entropy(logits_featex, y_featex)
+            loss = categorical_cross_entropy(logits, y_mix)
+            if self.feature_exchange_enabled:
+                embs_featex, y_featex = feature_exchange(
+                    embs_fft_mix, embs_stft_mix, y_mix, p=0.5
+                )
+                logits_featex = self.adaproj_featex(embs_featex, y_featex)
+                loss = loss + categorical_cross_entropy(logits_featex, y_featex)
         else:
             embs_orig = self(x)
             embs_mix = self(x_mix)

@@ -12,10 +12,7 @@ from sklearn.neighbors import LocalOutlierFactor as LOF
 
 
 def gwrp(x, r: float = 0.9, normalize: bool = False):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    n = torch.arange(x.shape[0])
-    if x.get_device() > -1:
-        n = n.to(device)
+    n = torch.arange(x.shape[0], device=x.device)
     w = torch.pow(r, n)
     if normalize:
         w = w / torch.sum(w)
@@ -39,7 +36,7 @@ def get_mean_embs(
         embs = torch.cat(embs, dim=0)
         machine_ids = torch.cat(machine_ids, dim=0)
         source_labels = torch.cat(source_labels, dim=0)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = embs[0].device if from_lists and len(embs) else embs.device
     for machine_id in torch.unique(machine_ids):
         if smote:
             if (
@@ -140,7 +137,7 @@ def get_standardization_stats(
         r=r,
         norm_type=norm_type,
     )
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = test_embs[0].device if len(test_embs) else torch.device("cpu")
     num_machine_ids = torch.max(test_machine_ids).int() + 1
     dists_source_mean = torch.zeros(num_machine_ids).to(device)
     dists_source_std = torch.ones(num_machine_ids).to(device)
@@ -192,7 +189,7 @@ def get_scores(
     dists_target_std=None,
 ):
     scores = torch.ones_like(test_machine_ids) * float("Inf")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = test_embs.device
     for machine_id in torch.unique(test_machine_ids):
         if torch.sum(mean_machine_ids == machine_id) > 0:
             if norm_type == "LOF":

@@ -27,8 +27,8 @@ def mixup_data(
 
     # sample random parameters
     batch_size = x.size()[0]
-    lam = torch.rand((batch_size, 1)).cuda()
-    apply_idx = (torch.rand(batch_size) < p).cuda()
+    lam = torch.rand((batch_size, 1), device=x.device)
+    apply_idx = torch.rand(batch_size, device=x.device) < p
 
     # apply mixup
     mixed_x = x.flip(dims=[0])
@@ -53,7 +53,7 @@ def feature_exchange(x1, x2, y, p):
 
     # sample random parameters
     batch_size = x1.size()[0]
-    apply_idx = (torch.rand(batch_size) < p).cuda()
+    apply_idx = torch.rand(batch_size, device=x1.device) < p
 
     # apply feature exchange
     exchanged_x1 = x1.flip(dims=[0])
@@ -345,12 +345,7 @@ class STFT_extractor(nn.Module):
                 x,
                 n_fft=self.nfft,
                 hop_length=512,
-                window=torch.hann_window(
-                    self.nfft,
-                    device=torch.device(
-                        "cuda" if torch.cuda.is_available() else "cpu"
-                    ),
-                ),
+                window=torch.hann_window(self.nfft, device=x.device),
                 center=False,
                 normalized=False,
                 return_complex=True,
